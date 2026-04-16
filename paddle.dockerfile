@@ -20,6 +20,21 @@ RUN pip install --no-cache-dir paddlepaddle-gpu==3.3.1 -i https://www.paddlepadd
 # Install PaddleOCR, paddlex[ocr] extras (required for PaddleOCR-VL-1.5 pipeline), & RunPod SDK
 RUN pip install --no-cache-dir "paddleocr>=2.8.0" "paddlex[ocr]" pillow numpy modelscope runpod
 
+# Pre-download model weights at build time so they're baked into the image.
+# Without this, ~2GB of weights download on every cold start.
+ENV PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=1
+RUN python -c "\
+import os, warnings, logging; \
+os.environ['FLAGS_enable_pir_api']='1'; \
+os.environ['FLAGS_use_mkldnn']='0'; \
+warnings.filterwarnings('ignore'); \
+logging.getLogger('ppocr').setLevel(logging.ERROR); \
+import paddle; paddle.set_device('cpu'); \
+from paddleocr import PaddleOCRVL; \
+PaddleOCRVL(pipeline_version='v1.5', use_doc_orientation_classify=False, use_doc_unwarping=False); \
+print('✅ Models cached successfully') \
+"
+
 # Copy the serverless handler
 COPY handler.py /app/handler.py
 
