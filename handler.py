@@ -1,123 +1,199 @@
 import os
 import base64
+import logging
 import tempfile
+import warnings
 from io import BytesIO
+from typing import Any
+
 from PIL import Image
 import runpod
 
-# Suppress noisy logs
-os.environ['FLAGS_enable_pir_api'] = '1'
-os.environ['FLAGS_use_mkldnn'] = '0'
-os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-import logging
+# Quiet Paddle / OCR logs
+os.environ["FLAGS_enable_pir_api"] = "1"
+os.environ["FLAGS_enable_pir_in_executor"] = "1"
+os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "1"
+os.environ["GLOG_minloglevel"] = "3"
+
 logging.getLogger("ppocr").setLevel(logging.ERROR)
+warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore", category=Warning)
+
+# Import torch before paddle to avoid DLL conflicts in some environments
+try:
+    import torch  # noqa: F401
+except ImportError:
+    pass
 
 import paddle
-if paddle.device.is_compiled_with_cuda():
-    paddle.set_device('gpu')
-else:
-    paddle.set_device('cpu')
-
 from paddleocr import PaddleOCRVL
 
-# --- GLOBAL WARMUP ---
-# Initializes when the Pod boots up, keeping the model loaded in VRAM
+if paddle.device.is_compiled_with_cuda():
+    paddle.set_device("gpu")
+    print("✅ Using GPU")
+else:
+    paddle.set_device("cpu")
+    print("⚠️ Using CPU")
+
 print("🚀 Initializing PaddleOCR-VL 1.5 Worker...")
-model = PaddleOCRVL(
+MODEL = PaddleOCRVL(
     pipeline_version="v1.5",
     use_doc_orientation_classify=False,
     use_doc_unwarping=False,
 )
 
-def tile_image(img, tile_size=1088, overlap=450):
-    w, h = img.size
-    tiles = []
-    step = tile_size - overlap
-    if step <= 0: raise ValueError("tile_size must be larger than overlap")
 
-    x_starts = [0] if w <= tile_size else list(range(0, w - tile_size + 1, step))
-    if w > tile_size and x_starts[-1] != w - tile_size: x_starts.append(w - tile_size)
+def _decode_image(image_b64: str) -> Image.Image:
+    if image_b64.startswith("data:") and "," in image_b64:
+        image_b64 = image_b64.split(",", 1)[1]
+    image_bytes = base64.b64decode(image_b64)
+    return Image.open(BytesIO(image_bytes)).convert("RGB")
 
-    y_starts = [0] if h <= tile_size else list(range(0, h - tile_size + 1, step))
-    if h > tile_size and y_starts[-1] != h - tile_size: y_starts.append(h - tile_size)
 
-    for y in y_starts:
-        for x in x_starts:
-            x2, y2 = min(x + tile_size, w), min(y + tile_size, h)
-            tiles.append((img.crop((x, y, x2, y2)), x, y))
-    return tiles
+def _block_value(block: Any, *keys: str, default: Any = None) -> Any:
+    if isinstance(block, dict):
+        for key in keys:
+            if key in block:
+                return block[key]
+    for key in keys:
+        value = getattr(block, key, None)
+        if value is not None:
+            return value
+    return default
 
-def dedupe_results(results, iou_thresh=0.3):
-    if not results: return results
-    def iou(b1, b2):
-        x1, y1 = max(b1[0], b2[0]), max(b1[1], b2[1])
-        x2, y2 = min(b1[2], b2[2]), min(b1[3], b2[3])
-        inter = max(0, x2 - x1) * max(0, y2 - y1)
-        union = (b1[2]-b1[0])*(b1[3]-b1[1]) + (b2[2]-b2[0])*(b2[3]-b2[1]) - inter
-        return inter / union if union > 0 else 0
 
-    keep, suppressed = [], set()
-    for i in range(len(results)):
-        if i in suppressed: continue
-        keep.append(results[i])
-        for j in range(i + 1, len(results)):
-            if j not in suppressed and iou(results[i][1], results[j][1]) > iou_thresh:
-                suppressed.add(j)
-    return keep
+def _coerce_bbox(raw: Any) -> list[float] | None:
+    if isinstance(raw, dict):
+        if {"x1", "y1", "x2", "y2"}.issubset(raw):
+            return [
+                float(raw["x1"]),
+                float(raw["y1"]),
+                float(raw["x2"]),
+                float(raw["y2"]),
+            ]
+        if {"x", "y", "w", "h"}.issubset(raw):
+            x = float(raw["x"])
+            y = float(raw["y"])
+            w = float(raw["w"])
+            h = float(raw["h"])
+            return [x, y, x + w, y + h]
 
-def handler(job):
-    """
-    The main RunPod serverless handler. 
-    Expects job['input'] to contain a base64 encoded image.
-    """
-    job_input = job['input']
-    
-    # Extract parameters from the incoming API request
-    image_b64 = job_input.get("image_base64")
-    tile_size = job_input.get("tile", 1088)
-    overlap = job_input.get("overlap", 450)
-    
-    if not image_b64:
-        return {"error": "Missing 'image_base64' in input"}
+    if isinstance(raw, list):
+        if len(raw) == 4 and all(isinstance(v, (int, float)) for v in raw):
+            return [float(v) for v in raw]
+
+        if len(raw) == 4 and all(isinstance(v, list) and len(v) == 2 for v in raw):
+            xs = [float(v[0]) for v in raw]
+            ys = [float(v[1]) for v in raw]
+            return [min(xs), min(ys), max(xs), max(ys)]
+
+        if len(raw) == 8 and all(isinstance(v, (int, float)) for v in raw):
+            xs = [float(raw[i]) for i in range(0, 8, 2)]
+            ys = [float(raw[i]) for i in range(1, 8, 2)]
+            return [min(xs), min(ys), max(xs), max(ys)]
+
+    return None
+
+
+def _extract_parsing_list(page_result: Any) -> list[Any]:
+    if isinstance(page_result, dict):
+        value = page_result.get("parsing_res_list")
+        return value if isinstance(value, list) else []
+    try:
+        value = page_result["parsing_res_list"]
+        return value if isinstance(value, list) else []
+    except Exception:
+        return []
+
+
+def _run_layout_ocr(image: Image.Image, job_input: dict[str, Any]) -> dict[str, Any]:
+    layout_threshold = float(job_input.get("layoutThreshold", 0.1))
+    use_doc_orientation_classify = bool(
+        job_input.get("useDocOrientationClassify", False)
+    )
+    use_doc_unwarping = bool(job_input.get("useDocUnwarping", False))
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+        temp_path = temp_file.name
+        image.save(temp_file, format="PNG")
 
     try:
-        # Decode image
-        image_data = base64.b64decode(image_b64)
-        img = Image.open(BytesIO(image_data)).convert("RGB")
-        
-        # 1. Tile Image
-        tiles = tile_image(img, tile_size=tile_size, overlap=overlap)
-        
-        all_results = []
-        # 2. Run Inference on Tiles
-        for idx, (tile_img, x_off, y_off) in enumerate(tiles, 1):
-            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-                tile_path = f.name
-                tile_img.save(f, format="PNG")
-                
-            try:
-                preds = model.predict(tile_path, use_layout_detection=True, layout_threshold=0.1)
-                for page_result in preds:
-                    parsing_list = page_result.get("parsing_res_list", [])
-                    for block in parsing_list:
-                        label, bbox, content = getattr(block, 'label', ''), getattr(block, 'bbox', []), getattr(block, 'content', '')
-                        if content and content.strip() and bbox and len(bbox) >= 4:
-                            # Shift to global coordinates
-                            shifted_bbox = [bbox[0]+x_off, bbox[1]+y_off, bbox[2]+x_off, bbox[3]+y_off]
-                            all_results.append((content.strip(), shifted_bbox, label))
-            finally:
-                os.unlink(tile_path)
+        preds = MODEL.predict(
+            temp_path,
+            use_layout_detection=True,
+            layout_threshold=layout_threshold,
+            use_doc_orientation_classify=use_doc_orientation_classify,
+            use_doc_unwarping=use_doc_unwarping,
+        )
 
-        # 3. Deduplicate
-        final_results = dedupe_results(all_results)
-        
-        # 4. Format JSON response for the swarm
-        formatted_output = [{"text": res[0], "bbox": res[1], "label": res[2]} for res in final_results]
-        
-        return {"status": "success", "detections": formatted_output, "total_found": len(formatted_output)}
+        detections: list[dict[str, Any]] = []
 
-    except Exception as e:
-        return {"error": str(e)}
+        for page_result in preds:
+            for block in _extract_parsing_list(page_result):
+                text = _block_value(block, "content", "text", "transcription", default="")
+                bbox = _coerce_bbox(
+                    _block_value(
+                        block,
+                        "bbox",
+                        "coordinate",
+                        "coordinates",
+                        "box",
+                        "polygon",
+                        default=None,
+                    )
+                )
+                label = _block_value(block, "label", "type", default="text")
+                score = _block_value(block, "score", "confidence", default=None)
 
-# Start the RunPod Serverless Worker
+                if not isinstance(text, str) or not text.strip():
+                    continue
+                if bbox is None:
+                    continue
+
+                item = {
+                    "text": text.strip(),
+                    "bbox": bbox,
+                    "label": str(label) if label is not None else "text",
+                }
+                if isinstance(score, (int, float)):
+                    item["score"] = float(score)
+
+                detections.append(item)
+
+        return {
+            "status": "success",
+            "detections": detections,
+            "total_found": len(detections),
+        }
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+
+def handler(job: dict[str, Any]) -> dict[str, Any]:
+    job_input = job.get("input", {}) or {}
+
+    # RunPod warmup path used by bp-scanner
+    if job_input.get("warm"):
+        return {
+            "status": "warm",
+            "detections": [],
+            "total_found": 0,
+        }
+
+    image_b64 = job_input.get("image_base64") or job_input.get("file")
+    if not image_b64:
+        return {"error": "Missing 'image_base64' or 'file' in input"}
+
+    try:
+        image = _decode_image(image_b64)
+        return _run_layout_ocr(image, job_input)
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
 runpod.serverless.start({"handler": handler})
