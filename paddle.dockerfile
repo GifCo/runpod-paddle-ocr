@@ -14,8 +14,8 @@ RUN apt-get update && apt-get install -y \
 RUN ln -s /usr/bin/python3 /usr/bin/python
 WORKDIR /app
 
-# Install PaddlePaddle 3.x GPU (required for PaddleOCRVL / PaddleX pipeline)
-RUN pip install --no-cache-dir paddlepaddle-gpu==3.0.0 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
+# Install PaddlePaddle 3.3.x GPU (required for PaddleOCRVL / PaddleX pipeline)
+RUN pip install --no-cache-dir paddlepaddle-gpu==3.3.1 -i https://www.paddlepaddle.org.cn/packages/stable/cu118/
 
 # Install PaddleOCR, paddlex[ocr] extras (required for PaddleOCR-VL-1.5 pipeline), & RunPod SDK
 RUN pip install --no-cache-dir "paddleocr>=2.8.0" "paddlex[ocr]" pillow numpy modelscope runpod
