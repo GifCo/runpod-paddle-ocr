@@ -29,9 +29,13 @@ RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/lib
 import os, warnings, logging; \
 os.environ['FLAGS_enable_pir_api']='1'; \
 os.environ['FLAGS_use_mkldnn']='0'; \
+os.environ['CUDA_VISIBLE_DEVICES']=''; \
 warnings.filterwarnings('ignore'); \
 logging.getLogger('ppocr').setLevel(logging.ERROR); \
 import paddle; paddle.set_device('cpu'); \
+# Monkey-patch GPU capability check (VL model checks this even on CPU) \
+import paddlex.utils.env; \
+paddlex.utils.env.get_gpu_compute_capability = lambda: (8, 0); \
 from paddleocr import PaddleOCR, PaddleOCRVL; \
 PaddleOCRVL(pipeline_version='v1.5', use_doc_orientation_classify=False, use_doc_unwarping=False); \
 print('✅ VL model cached'); \

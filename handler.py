@@ -16,6 +16,8 @@ os.environ["FLAGS_use_mkldnn"] = "0"
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK"] = "1"
 os.environ["GLOG_minloglevel"] = "3"
+os.environ["HF_HUB_OFFLINE"] = "1"
+os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 logging.getLogger("ppocr").setLevel(logging.ERROR)
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -44,12 +46,21 @@ MODEL_VL = PaddleOCRVL(
     use_doc_unwarping=False,
 )
 
+# Default detection tuning values
+DET_DB_THRESH = 0.1
+DET_DB_BOX_THRESH = 0.28
+DET_DB_UNCLIP_RATIO = 1.55
+
 print("🚀 Initializing PaddleOCR PP-OCRv5...")
 MODEL_OCR = PaddleOCR(
     lang="en",
     ocr_version="PP-OCRv5",
     text_rec_score_thresh=0.0,
     text_recognition_model_name="PP-OCRv5_server_rec",
+    use_angle_cls=True,
+    det_db_thresh=DET_DB_THRESH,
+    det_db_box_thresh=DET_DB_BOX_THRESH,
+    det_db_unclip_ratio=DET_DB_UNCLIP_RATIO,
 )
 
 
@@ -73,6 +84,10 @@ def _block_value(block: Any, *keys: str, default: Any = None) -> Any:
 
 
 def _coerce_bbox(raw: Any) -> list[float] | None:
+    # Convert numpy arrays to Python lists first
+    if hasattr(raw, 'tolist'):
+        raw = raw.tolist()
+
     if isinstance(raw, dict):
         if {"x1", "y1", "x2", "y2"}.issubset(raw):
             return [
@@ -186,24 +201,47 @@ def _run_layout_ocr(image: Image.Image, job_input: dict[str, Any]) -> dict[str, 
 
 def _run_standard_ocr(image: Image.Image, job_input: dict[str, Any]) -> dict[str, Any]:
     """Standard PP-OCRv5 — line-level text recognition."""
+
+    # Per-request overrides for detection tuning
+    det_thresh = float(job_input.get("detThresh", DET_DB_THRESH))
+    det_box_thresh = float(job_input.get("detBoxThresh", DET_DB_BOX_THRESH))
+    det_unclip_ratio = float(job_input.get("detUnclipRatio", DET_DB_UNCLIP_RATIO))
+
+    # Compute det_limit_side_len from image dimensions (round up to multiple of 32)
+    w, h = image.size
+    det_limit = ((max(w, h) + 31) // 32) * 32
+
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
         temp_path = temp_file.name
         image.save(temp_file, format="PNG")
 
     try:
-        result = MODEL_OCR.ocr(temp_path, cls=True)
+        result = MODEL_OCR.predict(
+            temp_path,
+            use_doc_orientation_classify=False,
+            use_doc_unwarping=False,
+            use_textline_orientation=False,
+            text_det_limit_side_len=det_limit,
+            text_det_thresh=det_thresh,
+            text_det_box_thresh=det_box_thresh,
+            text_det_unclip_ratio=det_unclip_ratio,
+        )
         detections: list[dict[str, Any]] = []
 
-        if result and result[0]:
-            for line in result[0]:
-                polygon, (text, score) = line
-                if not text or not text.strip():
+        for page_result in result:
+            # OCRResult is dict-like with keys: dt_polys, rec_texts, rec_scores
+            polys = page_result.get("dt_polys", []) or []
+            texts = page_result.get("rec_texts", []) or []
+            scores = page_result.get("rec_scores", []) or []
+
+            for poly, text, score in zip(polys, texts, scores):
+                if not text or not str(text).strip():
                     continue
-                bbox = _coerce_bbox(polygon)
+                bbox = _coerce_bbox(poly)
                 if bbox is None:
                     continue
                 detections.append({
-                    "text": text.strip(),
+                    "text": str(text).strip(),
                     "bbox": bbox,
                     "label": "text",
                     "score": float(score),
