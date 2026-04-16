@@ -28,7 +28,7 @@ except ImportError:
     pass
 
 import paddle
-from paddleocr import PaddleOCRVL
+from paddleocr import PaddleOCR, PaddleOCRVL
 
 if paddle.device.is_compiled_with_cuda():
     paddle.set_device("gpu")
@@ -37,11 +37,19 @@ else:
     paddle.set_device("cpu")
     print("⚠️ Using CPU")
 
-print("🚀 Initializing PaddleOCR-VL 1.5 Worker...")
-MODEL = PaddleOCRVL(
+print("🚀 Initializing PaddleOCR-VL 1.5...")
+MODEL_VL = PaddleOCRVL(
     pipeline_version="v1.5",
     use_doc_orientation_classify=False,
     use_doc_unwarping=False,
+)
+
+print("🚀 Initializing PaddleOCR PP-OCRv5...")
+MODEL_OCR = PaddleOCR(
+    lang="en",
+    ocr_version="PP-OCRv5",
+    text_rec_score_thresh=0.0,
+    text_recognition_model_name="PP-OCRv5_server_rec",
 )
 
 
@@ -109,6 +117,7 @@ def _extract_parsing_list(page_result: Any) -> list[Any]:
 
 
 def _run_layout_ocr(image: Image.Image, job_input: dict[str, Any]) -> dict[str, Any]:
+    """VL model — layout-aware OCR with block labels."""
     layout_threshold = float(job_input.get("layoutThreshold", 0.1))
     use_doc_orientation_classify = bool(
         job_input.get("useDocOrientationClassify", False)
@@ -120,7 +129,7 @@ def _run_layout_ocr(image: Image.Image, job_input: dict[str, Any]) -> dict[str, 
         image.save(temp_file, format="PNG")
 
     try:
-        preds = MODEL.predict(
+        preds = MODEL_VL.predict(
             temp_path,
             use_layout_detection=True,
             layout_threshold=layout_threshold,
@@ -164,6 +173,45 @@ def _run_layout_ocr(image: Image.Image, job_input: dict[str, Any]) -> dict[str, 
 
         return {
             "status": "success",
+            "model": "vl",
+            "detections": detections,
+            "total_found": len(detections),
+        }
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+
+def _run_standard_ocr(image: Image.Image, job_input: dict[str, Any]) -> dict[str, Any]:
+    """Standard PP-OCRv5 — line-level text recognition."""
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp_file:
+        temp_path = temp_file.name
+        image.save(temp_file, format="PNG")
+
+    try:
+        result = MODEL_OCR.ocr(temp_path, cls=True)
+        detections: list[dict[str, Any]] = []
+
+        if result and result[0]:
+            for line in result[0]:
+                polygon, (text, score) = line
+                if not text or not text.strip():
+                    continue
+                bbox = _coerce_bbox(polygon)
+                if bbox is None:
+                    continue
+                detections.append({
+                    "text": text.strip(),
+                    "bbox": bbox,
+                    "label": "text",
+                    "score": float(score),
+                })
+
+        return {
+            "status": "success",
+            "model": "ocr",
             "detections": detections,
             "total_found": len(detections),
         }
@@ -189,8 +237,13 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     if not image_b64:
         return {"error": "Missing 'image_base64' or 'file' in input"}
 
+    # Pick model: "vl" (default) or "ocr" (standard PP-OCRv5)
+    model_choice = str(job_input.get("model", "vl")).lower()
+
     try:
         image = _decode_image(image_b64)
+        if model_choice == "ocr":
+            return _run_standard_ocr(image, job_input)
         return _run_layout_ocr(image, job_input)
     except Exception as exc:
         return {"error": str(exc)}

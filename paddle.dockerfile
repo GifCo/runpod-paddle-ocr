@@ -1,5 +1,5 @@
-# Use a standard NVIDIA CUDA 11.8 runtime
-FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04
+# Use CUDA 11.8 devel image (has CUDA stubs needed for build-time model caching)
+FROM nvidia/cuda:11.8.0-cudnn8-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
@@ -23,17 +23,22 @@ RUN pip install --no-cache-dir "paddleocr>=2.8.0" "paddlex[ocr]" pillow numpy mo
 # Pre-download model weights at build time so they're baked into the image.
 # Without this, ~2GB of weights download on every cold start.
 ENV PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK=1
-RUN python -c "\
+RUN ln -s /usr/local/cuda/lib64/stubs/libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1 && \
+    LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH \
+    python -c "\
 import os, warnings, logging; \
 os.environ['FLAGS_enable_pir_api']='1'; \
 os.environ['FLAGS_use_mkldnn']='0'; \
 warnings.filterwarnings('ignore'); \
 logging.getLogger('ppocr').setLevel(logging.ERROR); \
 import paddle; paddle.set_device('cpu'); \
-from paddleocr import PaddleOCRVL; \
+from paddleocr import PaddleOCR, PaddleOCRVL; \
 PaddleOCRVL(pipeline_version='v1.5', use_doc_orientation_classify=False, use_doc_unwarping=False); \
-print('✅ Models cached successfully') \
-"
+print('✅ VL model cached'); \
+PaddleOCR(lang='en', ocr_version='PP-OCRv5', text_rec_score_thresh=0.0, text_recognition_model_name='PP-OCRv5_server_rec'); \
+print('✅ PP-OCRv5 model cached') \
+" && \
+    rm /usr/local/cuda/lib64/stubs/libcuda.so.1
 
 # Copy the serverless handler
 COPY handler.py /app/handler.py
